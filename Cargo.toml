@@ -1,6 +1,63 @@
 [package]
 name = "vanity-generator"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+rust-version = "1.79"
+description = "以太坊靓号地址生成器（BIP39/BIP32 + OsRng + GPG 加密输出）"
+license = "MIT"
+
+[lib]
+name = "vanity_generator"
+
+[[bin]]
+name = "vanity-generator"
+path = "src/main.rs"
 
 [dependencies]
+# ===== 密码学（全部权威库，禁止自实现任何原语）=====
+bip39 = "=1.2.0"                                    # BIP39（rust-bitcoin 生态）
+rand = "=0.9.5"                                     # default 含 std/std_rng/os_rng
+rand_core = { version = "=0.9.5", features = ["os_rng"] }  # 0.9 起特性名为 os_rng（getrandom 门控）
+k256 = { version = "=0.13.4", features = ["ecdsa", "arithmetic"] }  # NCC Group 审计通过
+tiny-keccak = { version = "=2.0.2", features = ["keccak"] }
+# sequoia 官方将 RustCrypto 后端标记为 experimental（算法覆盖面较窄），
+# 本项目仅用 ECDH(cv25519) + AES 加密路径，输出兼容性由 gpg 命令行回验测试覆盖。
+# allow-variable-time-crypto：本项目只用公钥加密（无解密/签名路径），
+# 实际涉及的 x25519-dalek 与 AES fixslice 实现本身为常数时间。
+# 如需切换为 sequoia 默认的 nettle（C 库，动态链接），改回 default 特性即可。
+sequoia-openpgp = { version = "=1.21.2", default-features = false, features = ["crypto-rust", "compression", "allow-experimental-crypto", "allow-variable-time-crypto"] }
+bip32 = { version = "=0.5.3", default-features = false, features = ["secp256k1", "std"] }
+
+# ===== 并行与性能 =====
+rayon = "=1.10.0"
+memchr = "=2.7.6"
+crossbeam-channel = "=0.5.17"
+
+# ===== 基础设施 =====
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_yaml = "=0.9.34"
+clap = { version = "=4.5.61", features = ["derive"] }
+anyhow = "=1.0.104"
+thiserror = "=1.0.69"
+zeroize = { version = "=1.8.2", features = ["derive"] }
+hex = "=0.4.3"
+
+[dev-dependencies]
+criterion = { version = "=0.5.1", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "vanity_bench"
+path = "benches/vanity_bench.rs"
+harness = false
+
+[profile.release]
+lto = "fat"             # 链接时优化（perf-book：可提升 10-20%+）
+codegen-units = 1       # 单编译单元，最优内联
+opt-level = 3
+panic = "abort"         # 去掉 unwind 开销
+debug = false
+overflow-checks = false # 边界行为在 test 模式验证
+
+[profile.test]
+# 测试模式下保留溢出检查（发布门槛：边界行为在 test 模式验证）
+overflow-checks = true
