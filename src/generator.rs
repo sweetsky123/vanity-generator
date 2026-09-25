@@ -65,13 +65,21 @@ pub struct Generator {
     path: String,
     /// 解析后的派生索引（hardened 已置高位）
     path_indices: Vec<u32>,
+    /// 大小写敏感：每轮额外计算 EIP-55 校验和形式参与匹配
+    case_sensitive: bool,
 }
 
 impl Generator {
     /// 构造生成器。
     ///
-    /// `path` / `path_indices` 来自 [`crate::config::Config`]（已校验）。
-    pub fn new(word_count: u8, path: &str, path_indices: &[u32]) -> Result<Self, VanityError> {
+    /// `path` / `path_indices` 来自 [`crate::config::Config`]（已校验）；
+    /// `case_sensitive` 为 true 时每次尝试额外计算 EIP-55 校验和形式。
+    pub fn new(
+        word_count: u8,
+        path: &str,
+        path_indices: &[u32],
+        case_sensitive: bool,
+    ) -> Result<Self, VanityError> {
         let entropy_len = match word_count {
             12 => 16,
             18 => 24,
@@ -90,6 +98,7 @@ impl Generator {
             entropy_len,
             path: path.to_string(),
             path_indices: path_indices.to_vec(),
+            case_sensitive,
         })
     }
 
@@ -205,8 +214,15 @@ impl Generator {
         })?;
 
         // 8. 匹配判定（front → back → middle 分层剪枝）
-        if !matcher.matches(&hex40) {
-            // 未命中：entropy / seed / xprv 随作用域结束擦除，不留敏感数据
+        //    大小写敏感模式：额外计算 EIP-55 校验和形式（栈上缓冲，零堆分配）
+        if self.case_sensitive {
+            let mut checksum = [0u8; 40];
+            eip55_into(&hex40, &mut checksum);
+            if !matcher.matches(&hex40, Some(&checksum)) {
+                // 未命中：entropy / seed / xprv 随作用域结束擦除，不留敏感数据
+                return Ok(None);
+            }
+        } else if !matcher.matches(&hex40, None) {
             return Ok(None);
         }
 
@@ -227,19 +243,12 @@ impl Generator {
 /// 仅在匹配命中后调用（对应规格 matching_rules 第 6 条）。
 pub fn eip55_checksum_address(hex40_lower: &[u8]) -> String {
     let mut digest = [0u8; 32];
-    let mut keccak = Keccak::v256();
-    keccak.update(hex40_lower);
-    keccak.finalize(&mut digest);
+    eip55_digest(hex40_lower, &mut digest);
 
     let mut out = String::with_capacity(42);
     out.push_str("0x");
     for (i, &b) in hex40_lower.iter().enumerate() {
-        // 第 i 个 hex 字符对应 keccak 摘要的第 i 个 nibble（高位在前）
-        let nibble = if i % 2 == 0 {
-            digest[i / 2] >> 4
-        } else {
-            digest[i / 2] & 0x0f
-        };
+        let nibble = nibble_at(&digest, i);
         let mut c = b as char;
         if nibble >= 8 {
             c = c.to_ascii_uppercase();
@@ -249,13 +258,56 @@ pub fn eip55_checksum_address(hex40_lower: &[u8]) -> String {
     out
 }
 
+/// EIP-55 校验和形式的栈上版本（无堆分配），供大小写敏感匹配热循环使用
+fn eip55_into(hex40_lower: &[u8], out: &mut [u8; 40]) {
+    let mut digest = [0u8; 32];
+    eip55_digest(hex40_lower, &mut digest);
+    for (i, &b) in hex40_lower.iter().enumerate() {
+        let nibble = nibble_at(&digest, i);
+        out[i] = if nibble >= 8 {
+            b.to_ascii_uppercase()
+        } else {
+            b
+        };
+    }
+}
+
+/// keccak256(小写 hex 字符串) —— EIP-55 的大小写来源
+fn eip55_digest(hex40_lower: &[u8], digest: &mut [u8; 32]) {
+    let mut keccak = Keccak::v256();
+    keccak.update(hex40_lower);
+    keccak.finalize(digest);
+}
+
+/// EIP-55：第 i 个 hex 字符对应摘要的第 i 个 nibble（高位在前）
+#[inline]
+fn nibble_at(digest: &[u8; 32], i: usize) -> u8 {
+    if i % 2 == 0 {
+        digest[i / 2] >> 4
+    } else {
+        digest[i / 2] & 0x0f
+    }
+}
+
 /// 当前 UTC 时间的 RFC3339 字符串（如 2026-09-25T12:00:00Z）
-fn iso8601_utc_now() -> String {
+pub(crate) fn iso8601_utc_now() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     iso8601_utc(secs)
+}
+
+/// 当前 UTC 时间的文件名时间戳（如 20260925_120000）
+pub(crate) fn yyyymmdd_hhmmss_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let iso = iso8601_utc(secs);
+    // "2026-09-25T12:00:00Z" → "20260925_120000"
+    let s: String = iso.chars().filter(|c| c.is_ascii_digit()).collect();
+    format!("{}_{}", &s[..8], &s[8..14])
 }
 
 /// Unix 秒 → RFC3339/ISO-8601 UTC（无外部时间依赖，Hinnant 民用历算法）
@@ -350,8 +402,8 @@ mod tests {
     /// pycryptodome keccak，锚定 EIP-55 官方向量），与 bip32/k256 双向互验。
     #[test]
     fn 确定性派生_24词全abandon_默认路径地址() {
-        let mut g = Generator::new(24, "m/44'/60'/0'/0/0", &DEFAULT_INDICES).unwrap();
-        let m = Matcher::new(None, None, None); // 全条件匹配器，必然命中
+        let mut g = Generator::new(24, "m/44'/60'/0'/0/0", &DEFAULT_INDICES, false).unwrap();
+        let m = Matcher::new(false, None, None, None); // 全条件匹配器，必然命中
         let hit = g.derive_and_match(&[0u8; 32], &m).unwrap().expect("应命中");
         assert_eq!(hit.address, "0xF278cF59F82eDcf871d630F28EcC8056f25C1cdb");
         assert_eq!(hit.path, "m/44'/60'/0'/0/0");
@@ -362,13 +414,13 @@ mod tests {
     /// 12 词 / 18 词确定性地址（同一独立实现交叉验证）
     #[test]
     fn 确定性派生_12词与18词() {
-        let m = Matcher::new(None, None, None);
+        let m = Matcher::new(false, None, None, None);
 
-        let mut g12 = Generator::new(12, "m/44'/60'/0'/0/0", &DEFAULT_INDICES).unwrap();
+        let mut g12 = Generator::new(12, "m/44'/60'/0'/0/0", &DEFAULT_INDICES, false).unwrap();
         let hit12 = g12.derive_and_match(&[0u8; 16], &m).unwrap().expect("应命中");
         assert_eq!(hit12.address, "0x9858EfFD232B4033E47d90003D41EC34EcaEda94");
 
-        let mut g18 = Generator::new(18, "m/44'/60'/0'/0/0", &DEFAULT_INDICES).unwrap();
+        let mut g18 = Generator::new(18, "m/44'/60'/0'/0/0", &DEFAULT_INDICES, false).unwrap();
         let hit18 = g18.derive_and_match(&[0u8; 24], &m).unwrap().expect("应命中");
         assert_eq!(hit18.address, "0x197A1bEE163923815Ba58EaD0F14B3Fcd8C5926d");
     }
@@ -376,10 +428,10 @@ mod tests {
     /// 路径差异化：0/217 与极深路径 0/2147483647（边界测试要求）
     #[test]
     fn 确定性派生_路径差异化与极深路径() {
-        let m = Matcher::new(None, None, None);
+        let m = Matcher::new(false, None, None, None);
 
         let mut g217 =
-            Generator::new(24, "m/44'/60'/0'/0/217", &[0x8000_002C, 0x8000_003C, 0x8000_0000, 0, 217])
+            Generator::new(24, "m/44'/60'/0'/0/217", &[0x8000_002C, 0x8000_003C, 0x8000_0000, 0, 217], false)
                 .unwrap();
         let hit = g217.derive_and_match(&[0u8; 32], &m).unwrap().expect("应命中");
         assert_eq!(hit.address, "0xCaCFFdD18ecD36cac714cC9457fc508008f222b2");
@@ -388,6 +440,7 @@ mod tests {
             24,
             "m/44'/60'/0'/0/2147483647",
             &[0x8000_002C, 0x8000_003C, 0x8000_0000, 0, 2_147_483_647],
+            false,
         )
         .unwrap();
         let hit = gdeep.derive_and_match(&[0u8; 32], &m).unwrap().expect("应命中");
@@ -422,9 +475,9 @@ mod tests {
     /// 同熵同参数必须可重现（确定性要求）
     #[test]
     fn 同熵两次派生结果一致() {
-        let m = Matcher::new(None, None, None);
-        let mut a = Generator::new(24, "m/44'/60'/0'/0/0", &DEFAULT_INDICES).unwrap();
-        let mut b = Generator::new(24, "m/44'/60'/0'/0/0", &DEFAULT_INDICES).unwrap();
+        let m = Matcher::new(false, None, None, None);
+        let mut a = Generator::new(24, "m/44'/60'/0'/0/0", &DEFAULT_INDICES, false).unwrap();
+        let mut b = Generator::new(24, "m/44'/60'/0'/0/0", &DEFAULT_INDICES, false).unwrap();
         let ra = a.derive_and_match(&[7u8; 32], &m).unwrap().unwrap();
         let rb = b.derive_and_match(&[7u8; 32], &m).unwrap().unwrap();
         assert_eq!(ra.address, rb.address);
@@ -474,8 +527,8 @@ mod tests {
     /// 生产路径冒烟：OsRng 循环 50 次不命中、无 panic（front=ffff 剪枝）
     #[test]
     fn try_once_osrng_冒烟() {
-        let m = Matcher::new(Some(b"ffff".to_vec()), None, None);
-        let mut g = Generator::new(24, "m/44'/60'/0'/0/0", &DEFAULT_INDICES).unwrap();
+        let m = Matcher::new(false, Some(b"ffff".to_vec()), None, None);
+        let mut g = Generator::new(24, "m/44'/60'/0'/0/0", &DEFAULT_INDICES, false).unwrap();
         for _ in 0..50 {
             let r = g.try_once(&m).unwrap();
             assert!(r.is_none(), "ffff 前缀在 50 次内命中概率约 2^-196，不应命中");
@@ -485,8 +538,8 @@ mod tests {
     /// 熵长度不匹配：12 词生成器注入 32 字节熵应报内部错误而非 panic
     #[test]
     fn 熵长度不匹配_报错() {
-        let mut g = Generator::new(12, "m/44'/60'/0'/0/0", &DEFAULT_INDICES).unwrap();
-        let m = Matcher::new(None, None, None);
+        let mut g = Generator::new(12, "m/44'/60'/0'/0/0", &DEFAULT_INDICES, false).unwrap();
+        let m = Matcher::new(false, None, None, None);
         let r = g.derive_and_match(&[0u8; 32], &m);
         assert!(r.is_err(), "bip39 对 32 字节熵会生成 24 词，本项目要求长度与词数一致");
     }
