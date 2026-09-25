@@ -1,0 +1,83 @@
+name: 靓号演示
+
+# 手动触发：使用仓库 Secrets 中的 `config`（config.yaml 内容）与
+# `gpg`（GPG 公钥 armor 内容）运行一次靓号搜索，
+# 生成的加密文件随本次运行发布到 Release（demo-run-<编号>）。
+on:
+  workflow_dispatch:
+    inputs:
+      timeout_minutes:
+        description: 单次运行超时（分钟），超时后已有的加密文件仍会上传
+        required: false
+        default: "15"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  demo:
+    name: 运行靓号搜索
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查 Secrets 是否已配置
+        shell: bash
+        run: |
+          if [ -z "${{ secrets.config }}" ]; then
+            echo "::error::仓库 Secrets 缺少 `config`（config.yaml 内容）。请到 Settings → Secrets and variables → Actions 添加。"; exit 1
+          fi
+          if [ -z "${{ secrets.gpg }}" ]; then
+            echo "::error::仓库 Secrets 缺少 `gpg`（GPG 公钥 armor 内容）。请到 Settings → Secrets and variables → Actions 添加。"; exit 1
+          fi
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存依赖
+        uses: Swatinem/rust-cache@v2
+
+      - name: 构建
+        run: cargo build --release
+
+      - name: 运行（配置与公钥均通过环境变量注入）
+        id: run
+        timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || '15') }}
+        shell: bash
+        env:
+          VANITY_CONFIG: ${{ secrets.config }}
+          VANITY_GPG_KEY: ${{ secrets.gpg }}
+        run: |
+          mkdir demo && cp target/release/vanity-generator demo/
+          cd demo
+          ./vanity-generator 2>&1 | tee run.log
+          echo "hits=$(ls vanity_*.asc 2>/dev/null | wc -l)" >> "$GITHUB_OUTPUT"
+
+      - name: 汇总加密产物（超时/未命中时也可能有部分产物）
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p release-assets || true
+          cp demo/vanity_*.asc release-assets/ 2>/dev/null || true
+          cp demo/run.log release-assets/ 2>/dev/null || true
+          ls -la release-assets/ || true
+
+      - name: 发布 Release（demo-run-<编号>）
+        if: always()
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if compgen -G "release-assets/*" > /dev/null; then
+            gh release create "demo-run-${GITHUB_RUN_NUMBER}" \
+              --title "靓号演示 · 第 ${GITHUB_RUN_NUMBER} 次运行" \
+              --notes "加密产物由仓库 Secrets 中的公钥加密，仅持对应私钥者可解密。运行日志见 release-assets。" \
+              release-assets/* || \
+            gh release upload "demo-run-${GITHUB_RUN_NUMBER}" release-assets/* --clobber
+          else
+            echo "本次运行没有产出加密文件（超时或未命中）。"
+          fi

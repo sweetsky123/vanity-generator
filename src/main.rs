@@ -99,17 +99,11 @@ fn run() -> Result<()> {
     let seq = AtomicU32::new(0);
     let encrypt_err: Mutex<Option<VanityError>> = Mutex::new(None);
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .map_err(|e| {
-            VanityError::internal(
-                format!("failed to build thread pool: {e}"),
-                format!("线程池创建失败：{e}"),
-            )
-        })?;
-
-    pool.install(|| {
+    // 直接使用 rayon 全局池（默认 = available_parallelism 线程）：
+    // scope 闭包在本线程执行收包循环，N 个 worker 全部进入池内并行。
+    // 不自建 ThreadPool：自建池若把闭包 install 到池内线程，
+    // 会占掉一个 worker 槽位导致实际并行度少 1（已实测踩坑）。
+    {
         // 预先借用/复制跨线程共享的数据（避免 move 闭包逐值搬移）
         let matcher = &matcher;
         let cfg_path = &cfg.path;
@@ -202,7 +196,7 @@ fn run() -> Result<()> {
             }
             let _ = encrypted_files;
         });
-    });
+    }
 
     // 4. 汇总
     let total = attempts.load(Ordering::Relaxed);

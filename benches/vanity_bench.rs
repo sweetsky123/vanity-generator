@@ -103,6 +103,34 @@ fn bench_pipeline_threads(c: &mut Criterion, threads: usize) {
 }
 
 fn bench_pipeline(c: &mut Criterion) {
+    // ---- 分阶段剖析（性能瓶颈定位）----
+    // 阶段 1：BIP39 种子（PBKDF2-HMAC-SHA512 × 2048 轮，历史瓶颈）
+    {
+        use bip39::{Language, Mnemonic};
+        let m = Mnemonic::from_entropy_in(Language::English, &[7u8; 32]).unwrap();
+        c.bench_function("pipeline/stage1_seed_pbkdf2", |b| {
+            b.iter(|| m.to_seed(black_box("")))
+        });
+    }
+    // 阶段 2：BIP32 派生 m/44'/60'/0'/0/0（3 次 hardened + 2 次 normal CKD）
+    {
+        use bip39::{Language, Mnemonic};
+        let seed = Mnemonic::from_entropy_in(Language::English, &[7u8; 32])
+            .unwrap()
+            .to_seed("");
+        c.bench_function("pipeline/stage2_bip32_derive", |b| {
+            b.iter(|| {
+                let mut x = bip32::XPrv::new(black_box(seed.as_slice())).unwrap();
+                for idx in PATH_INDICES {
+                    let hard = (idx & 0x8000_0000) != 0;
+                    let cn = bip32::ChildNumber::new(idx & 0x7FFF_FFFF, hard).unwrap();
+                    x = x.derive_child(cn).unwrap();
+                }
+                black_box(x.to_bytes())
+            })
+        });
+    }
+    // 全链路（OsRng 熵 → 匹配，性能基准的吞吐基线）
     bench_pipeline_threads(c, 1);
     bench_pipeline_threads(c, 2);
     bench_pipeline_threads(c, 4);

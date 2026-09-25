@@ -12,6 +12,15 @@ front: "8888"
 # middle: "8888"
 back: "8888"
 
+# 是否大小写敏感（可选，默认 false）
+# true 时匹配目标是地址的 EIP-55 校验和形式：
+#   例如 front: "AaAaAa" 只命中校验和形式 0xAaAaAa…，0xaaaaaa… 不命中。
+#   注意：字母越多越难命中（每位字母额外引入约 1/2 的约束）。
+case_sensitive: false
+
+# 进度通知（可选）：每尝试 N 次输出一行总数与速率；填 false 禁用
+progress_every: 100000
+
 # BIP32 派生路径，不填默认 m/44'/60'/0'/0/0
 # 允许任意合法路径，如 m/44'/60'/0'/0/217
 path: "m/44'/60'/0'/0/0"
@@ -22,4 +31,6 @@ count: 5
 
 # GPG 公钥文件名（相对可执行文件所在目录；后缀名不限，
 # 只要能用纯文本打开且首行是 -----BEGIN PGP PUBLIC KEY BLOCK-----）
+# 若设置了环境变量 VANITY_GPG_KEY（公钥 armor 内容），则优先使用环境变量，
+# 此字段可不填。
 gpg_key_file: "fx1024.asc"

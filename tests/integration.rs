@@ -220,3 +220,49 @@ fn chrono_suffix() -> u128 {
         .map(|d| d.as_nanos())
         .unwrap_or(0)
 }
+
+/// 并行扩展性门禁（发布门槛：多线程吞吐 ≥ 单线程 × 线程数 × 0.7）。
+///
+/// 本开发沙箱实测仅提供约 1 个物理核算力（双进程并发各自减半），
+/// 无法在本机验证扩展性，标记 `#[ignore]`；CI（GitHub runner 真多核）
+/// 通过 `cargo test --release -- --ignored` 执行本门禁。
+#[test]
+#[ignore]
+fn 并行扩展性门禁() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    let matcher = Matcher::new(false, Some(b"ffff".to_vec()), None, None);
+    let run = |threads: usize| -> u64 {
+        let done = AtomicU64::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                let done = &done;
+                let matcher = &matcher;
+                s.spawn(move || {
+                    let mut g =
+                        Generator::new(12, "m/44'/60'/0'/0/0", &PATH_INDICES, false).unwrap();
+                    let deadline = Instant::now() + Duration::from_millis(3000);
+                    while Instant::now() < deadline {
+                        let _ = g.try_once(matcher);
+                        done.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        done.load(Ordering::Relaxed)
+    };
+
+    let threads = 2usize;
+    let single = run(1) as f64 / 3.0;
+    let multi = run(threads) as f64 / 3.0;
+    let ratio = multi / single;
+    let gate = 0.7 * threads as f64;
+    println!(
+        "单线程 {single:.0}/s，{threads} 线程 {multi:.0}/s，扩展比 {ratio:.2}（门槛 {gate:.2}）"
+    );
+    assert!(
+        ratio >= gate,
+        "并行扩展性不达标：{ratio:.2} < {gate:.2}（可能运行环境为单核等效算力）"
+    );
+}

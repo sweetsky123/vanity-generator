@@ -1,0 +1,125 @@
+# 以太坊靓号地址生成器
+
+一个完全离线运行的以太坊靓号地址生成器：按 BIP39/BIP32 标准生成助记词与派生地址，
+多线程全速搜索符合自定义前缀/中缀/后缀规则的地址，命中后立即用你的 GPG 公钥加密
+落盘。熵源只使用操作系统安全随机数（`OsRng`），助记词与私钥全程不落明文、不出内存，
+加密文件只有持有对应私钥的人能解开。单二进制交付，行为全部由 `config.yaml` 驱动。
+
+## 安装
+
+```bash
+cargo build --release
+# 产物：target/release/vanity-generator（或从 Release 页面下载对应平台的压缩包）
+```
+
+Release 页面提供 Linux（musl，静态链接）/ Windows（MSVC）/ macOS（x86_64 与
+Apple Silicon）的预编译二进制，解压后与 config.yaml 放在同一目录即可直接运行。
+
+## 使用
+
+可执行文件与 `config.yaml` 放在同一目录，直接运行：
+
+```bash
+./vanity-generator                 # 读取同目录 config.yaml
+./vanity-generator --config /path/to/config.yaml
+```
+
+也支持环境变量注入（优先级高于同目录文件，适合 CI 与容器）：
+
+- `VANITY_CONFIG`：config.yaml 的**完整内容**
+- `VANITY_GPG_KEY`：GPG 公钥 armor 的**完整内容**（优先于 `gpg_key_file` 字段）
+
+config.yaml 完整示例（仓库根目录同附 `config.example.yaml`）：
+
+```yaml
+# 助记词词数：只允许 12 / 18 / 24
+word_count: 24
+# 靓号规则（至少定义一个）：front 前缀 / middle 任意包含 / back 后缀
+# 去掉 0x 后匹配；同时定义时必须同时满足
+front: "8888"
+back: "8888"
+# 大小写敏感（默认 false）：true 时按 EIP-55 校验和形式匹配，
+# 如 front: "AaAaAa" 只命中 0xAaAaAa…，0xaaaaaa… 不命中
+case_sensitive: false
+# 每尝试 N 次输出一行进度（总数/速率/耗时）；false 禁用
+progress_every: 100000
+# BIP32 派生路径，不填默认 m/44'/60'/0'/0/0
+path: "m/44'/60'/0'/0/0"
+# 目标命中数量（1..=1000），每命中一个立即加密落盘后继续
+count: 5
+# GPG 公钥文件（相对可执行文件目录，后缀名不限，纯文本 armor 即可）
+gpg_key_file: "fx1024.asc"
+```
+
+命中后生成的 `vanity_日期_时间_序号.asc` 是 ASCII Armor 加密文件，可在任何装有
+GnuPG 的机器上解密：`gpg --decrypt vanity_xxx.asc > wallet.txt`。
+
+## 工作原理
+
+```mermaid
+graph LR
+    A[OsRng 熵 128/192/256bit] --> B[BIP39 助记词<br/>英文词表]
+    B --> C[PBKDF2-HMAC-SHA512×2048<br/>种子]
+    C --> D[BIP32 XPrv<br/>按配置路径逐层派生]
+    D --> E[secp256k1 公钥]
+    E --> F[Keccak-256<br/>取后 20 字节]
+    F --> G[小写 hex 40 字符<br/>front/back memcmp + middle SIMD]
+    G -->|命中| H[EIP-55 校验和<br/>GPG 公钥加密落盘]
+    G -->|未命中| A
+```
+
+每次尝试从熵开始完整走一遍 BIP39 → BIP32 → secp256k1 → Keccak 链路（与
+MetaMask 行为对齐：英文词表、空 passphrase、m/44'/60'/0'/0/0）。命中前地址
+匹配全部在栈上 40 字节缓冲内完成，零堆分配；命中后才计算 EIP-55 校验和并进入
+加密流程，未命中的敏感数据随作用域结束擦除（Zeroizing）。
+
+## 性能
+
+基准环境：2 vCPU 云虚拟机（实测等效约 1 个物理核）。
+单次尝试成本分解（`examples/perf_probe`，24 词）：
+PBKDF2×2048 轮 1.77ms（77%）+ BIP32 派生 0.40ms + 公钥/Keccak/匹配 0.18ms，
+合计约 2.3ms/次。PBKDF2 是 BIP39 标准的固定成本，本项目不做任何省略，
+详见 `docs/performance.md`（含优化 A/B 记录与浏览器工具对比说明）。
+
+| 配置 | 吞吐 |
+|---|---|
+| 单核（24 词） | 约 450 addr/s |
+| N 核机器（默认全速多线程） | 约 380×N addr/s（扩展性 ≥ 0.7×N，CI 真多核门禁验证） |
+| 12 词（单核） | 约 460 addr/s（词数对成本影响很小） |
+| 匹配器单次判定（front 剪枝） | 约 15 ns |
+
+预期查找时间（按单核 450 addr/s，16^n 均匀分布取期望值；多核按核数近线性折算）：
+
+| 前缀长度 | 期望尝试次数 | 单核期望耗时 | 8 核期望耗时 |
+|---|---|---|---|
+| 2 位 | 256 | 约 0.6 秒 | 约 0.1 秒 |
+| 4 位 | 65 536 | 约 2.4 分钟 | 约 18 秒 |
+| 6 位 | 1 677 万 | 约 10 小时 | 约 1.3 小时 |
+| 8 位 | 43 亿 | 约 111 天 | 约 14 天 |
+
+## 安全说明
+
+- **完全离线**：除读写本地文件外无任何网络行为，私钥不离开内存。
+- **熵源**：仅使用操作系统安全随机数（`getrandom`/`OsRng`），熵源失败时
+  fail-closed 直接终止，绝不降级。对照 Profanity 事故：其 32 位用户态熵被
+  2^32 枚举攻破，本工具不存在此类缩短路径。
+- **加密输出**：结果用你的 GPG 公钥（sequoia-openpgp 实现，输出与 GnuPG 兼容）
+  加密后落盘，运行机器上不会出现明文助记词文件。
+- **内存擦除**：熵、种子、助记词、加密前明文均用 Zeroizing 包裹，用完即擦。
+- **长靓号的代价**：前缀每多一位，期望尝试次数 ×16；被破解的难度随之下降，
+  请按需选择长度，避免为炫技搜索超长前缀。
+
+## 测试
+
+| 层级 | 内容 |
+|---|---|
+| 单元 | BIP39 官方向量（12/18/24 词）、BIP32 官方向量 1、确定性派生地址（与独立 Python 实现双互验）、EIP-55 官方样例、私钥边界 0/n 拒绝、非法配置矩阵 |
+| 集成 | gpg 命令行生成密钥→本工具加密→gpg 解密回验；fx1024 包结构校验；确定性 RNG 10000 次可重现；2 字符前缀 10000 次内命中 |
+| 基准 | criterion：匹配器分解耗时、单线程全链路、2/4/8 线程吞吐（多线程加速比 ≥ 0.7×线程数） |
+
+本地运行：`cargo test`（快速）、`cargo test --release -- --ignored`（重量级）、
+`cargo bench`。
+
+## 许可证
+
+MIT
