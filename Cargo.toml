@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 # ===== 密码学（全部权威库，禁止自实现任何原语）=====
-bip39 = "=1.2.0"                                    # BIP39（rust-bitcoin 生态）
+bip39 = { version = "=1.2.0", features = ["zeroize"] }   # BIP39（rust-bitcoin 生态；启用助记词 drop 擦除）
 rand = "=0.9.5"                                     # default 含 std/std_rng/os_rng
 rand_core = { version = "=0.9.5", features = ["os_rng"] }  # 0.9 起特性名为 os_rng（getrandom 门控）
 k256 = { version = "=0.13.4", features = ["ecdsa", "arithmetic"] }  # NCC Group 审计通过

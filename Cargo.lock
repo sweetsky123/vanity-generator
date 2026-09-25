@@ -184,6 +184,7 @@ dependencies = [
  "rand_core 0.4.3",
  "serde",
  "unicode-normalization",
+ "zeroize",
 ]
 
 [[package]]
