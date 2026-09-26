@@ -135,6 +135,7 @@ jobs:
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           mkdir -p release-assets
           find all-hits -type f -name 'vanity_*.asc' -exec cp {} release-assets/ \; 2>/dev/null || true
