@@ -24,8 +24,10 @@ tiny-keccak = { version = "=2.0.2", features = ["keccak"] }
 # 本项目仅用 ECDH(cv25519) + AES 加密路径，输出兼容性由 gpg 命令行回验测试覆盖。
 # allow-variable-time-crypto：本项目只用公钥加密（无解密/签名路径），
 # 实际涉及的 x25519-dalek 与 AES fixslice 实现本身为常数时间。
+# 不启用 compression：输出为未压缩 Literal 数据、不解析压缩报文，
+# 同时去掉 bzip2 的 C 依赖 → 全依赖树纯 Rust，任意目标可交叉编译。
 # 如需切换为 sequoia 默认的 nettle（C 库，动态链接），改回 default 特性即可。
-sequoia-openpgp = { version = "=1.21.2", default-features = false, features = ["crypto-rust", "compression", "allow-experimental-crypto", "allow-variable-time-crypto"] }
+sequoia-openpgp = { version = "=1.21.2", default-features = false, features = ["crypto-rust", "allow-experimental-crypto", "allow-variable-time-crypto"] }
 bip32 = { version = "=0.5.3", default-features = false, features = ["secp256k1", "std"] }
 
 # ===== 并行与性能 =====
