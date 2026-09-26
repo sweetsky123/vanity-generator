@@ -1,0 +1,49 @@
+# 内存消耗分析与计算公式
+
+> 测量环境：x86_64 Linux，release 构建（静态链接），规则 front=fff / count=1；
+> 线程数经 `RAYON_NUM_THREADS` 覆盖（生产默认 = available_parallelism）。
+> 峰值取 `/proc/<pid>/status` 的 `VmHWM`（内核维护的进程生命周期 RSS 峰值），
+> 于搜索进行中采样（分配在启动期已完成，采样点代表性充分）。
+
+## 实测数据
+
+| 工作线程数 | 峰值 RSS（VmHWM） |
+|---|---|
+| 1 | ≈ 1.7 MB |
+| 2 | ≈ 4.1 MB |
+| 4 | ≈ 4.4 MB |
+| 8 | ≈ 4.2 MB |
+
+## 计算公式
+
+```
+Mem(N) ≈ C_base + C_pool·[N≥2] + N·C_thread
+
+  C_base  ≈ 1.7 MB   单线程常驻：代码段/静态数据（BIP39 词表等）、
+                      进程运行时、当前搜索的缓冲
+  C_pool  ≈ 2.4 MB   rayon 线程池一次性建立（线程栈实触页 + 池结构），
+                      N≥2 时出现一次，之后不再增长
+  C_thread ≈ 0.03 MB 每增加一个线程的边际成本（栈为 2MB 虚拟预留，
+                      实触页仅数十 kB；各 worker 局部缓冲微小）
+```
+
+**结论性公式（工程口径）**：任意多线程配置下 `Mem ≈ 4.2 MB`（对 N 不敏感）；
+单线程 `≈ 1.7 MB`。额外说明：
+
+- 命中产物按个落盘（每个 .asc 约 0.5 KB 磁盘），不占常驻内存；
+  GPG 加密为命中时瞬时缓冲，随即释放。
+- 与 Kerkour 碎片文场景对照：本进程生命周期短（分钟级）、分配速率低
+  （约 10²~10³ 次/秒的 KB 级分配），**不存在长时运行碎片化 plateau 风险**，
+  也因此无需更换全局分配器。
+- CI runner（7 GB）/ 最低 VPS（512 MB）均余量充足；20 台矩阵并行时
+  单机内存占用不变（每台独立进程）。
+
+## 复现方法
+
+```bash
+# 任一线程档：后台启动 → 搜索进行中读取 VmHWM
+RAYON_NUM_THREADS=4 ./vanity-generator >/dev/null 2>&1 & P=$!
+sleep 3
+awk '/VmHWM/{print $2" kB"}' /proc/$P/status
+kill $P
+```
