@@ -38,9 +38,9 @@ jobs:
           git add vendor .cargo/config.toml Cargo.lock
           git commit -m "chore: 内置全部依赖源码（cargo vendor）
 
-- vendor/ 含完整依赖树源码，.crate checksum 与 Cargo.lock 锚定
-- .cargo/config.toml 将 crates-io 替换为 vendored-sources（离线编译）
-- 已验证：cargo build/test --offline 全绿"
+          - vendor/ 含完整依赖树源码，.crate checksum 与 Cargo.lock 锚定
+          - .cargo/config.toml 将 crates-io 替换为 vendored-sources（离线编译）
+          - 已验证：cargo build/test --offline 全绿"
           git push
       - name: 删除本临时工作流
         run: |
