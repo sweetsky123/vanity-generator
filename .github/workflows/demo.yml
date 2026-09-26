@@ -139,7 +139,9 @@ jobs:
         run: |
           mkdir -p release-assets
           find all-hits -type f -name 'vanity_*.asc' -exec cp {} release-assets/ \; 2>/dev/null || true
-          find all-hits -type f -name 'run.log' -exec sh -c 'cp "$1" "release-assets/machine-$(echo "$1" | grep -oE "machine-[0-9]+").log"' _ {} \; 2>/dev/null || true
+          for d in all-hits/hits-machine-*; do
+            [ -f "$d/run.log" ] && cp "$d/run.log" "release-assets/$(basename "$d").log" || true
+          done
           HITS=$(ls release-assets/vanity_*.asc 2>/dev/null | wc -l)
           echo "总命中数：$HITS"
           EXPECT=$(grep -h "期望尝试" all-hits/hits-machine-1/run.log 2>/dev/null | head -1 || true)
