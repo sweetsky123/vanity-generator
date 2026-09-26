@@ -158,7 +158,10 @@ jobs:
             done
           }
 
-          target/release/vanity-generator > run.log 2>&1 &
+          # 二进制把命中文件写到其所在目录（exe_dir）；进入该目录运行，
+          # 使 vanity_*.asc 与 run.log 都落在当前工作目录，监听循环直接可见
+          cd target/release
+          ./vanity-generator > run.log 2>&1 &
           BIN=$!
           uploaded=""
           killed=0
@@ -192,7 +195,7 @@ jobs:
 
       - name: 构建产物检查（防路径遗漏）
         if: always()
-        run: ls -la vanity_*.asc 2>/dev/null || echo "（本机无命中文件——可能被共同目标提前停止或未命中）"
+        run: ls -la target/release/vanity_*.asc 2>/dev/null || echo "（本机无命中文件——可能被共同目标提前停止或未命中）"
 
   publish:
     name: 整理发布
