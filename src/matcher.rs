@@ -30,6 +30,8 @@ pub struct Matcher {
     back: Option<Vec<u8>>,
     /// 中缀搜索器（预构建，SIMD 加速；`into_owned` 后持有 needle 所有权）
     middle: Option<memmem::Finder<'static>>,
+    /// 原始中缀 needle（供期望次数估算与文本描述，不参与匹配）
+    middle_raw: Option<Vec<u8>>,
 }
 
 impl Matcher {
@@ -41,6 +43,7 @@ impl Matcher {
         middle: Option<Vec<u8>>,
         back: Option<Vec<u8>>,
     ) -> Self {
+        let middle_raw = middle.clone().filter(|m| !m.is_empty());
         Self {
             case_sensitive,
             front: front.filter(|f| !f.is_empty()),
@@ -49,6 +52,8 @@ impl Matcher {
             middle: middle
                 .filter(|m| !m.is_empty())
                 .map(|m| memmem::Finder::new(m.as_slice()).into_owned()),
+            // 原始中缀 needle（供期望次数估算与文本描述）
+            middle_raw,
         }
     }
 
@@ -87,6 +92,51 @@ impl Matcher {
             }
         }
         true
+    }
+
+    /// 期望尝试次数估计（幂律近似，用于启动提示与可行性预估）。
+    ///
+    /// - front/back：每位 hex 字符贡献 16 倍；
+    /// - middle：按 (40-len+1) 个可能起点近似；
+    /// - 大小写敏感模式下每个字母位额外贡献 2 倍（EIP-55 案例约随机）。
+    pub fn expected_attempts(&self) -> f64 {
+        let mut p = 1.0f64;
+        let mut hex_len = 0.0f64;
+        let mut letters = 0usize;
+        if let Some(f) = &self.front {
+            hex_len += f.len() as f64;
+            letters += f.iter().filter(|b| b.is_ascii_alphabetic()).count();
+        }
+        if let Some(b) = &self.back {
+            hex_len += b.len() as f64;
+            letters += b.iter().filter(|b| b.is_ascii_alphabetic()).count();
+        }
+        p /= 16f64.powf(hex_len);
+        if let Some(m) = &self.middle_raw {
+            let n = m.len() as f64;
+            // 子串在 40 字符地址中出现的概率 ≈ (41-n) × 16^-n（上限 1）
+            p *= ((41.0 - n).max(1.0) / 16f64.powf(n)).min(1.0);
+            letters += m.iter().filter(|b| b.is_ascii_alphabetic()).count();
+        }
+        if self.case_sensitive {
+            p /= 2f64.powi(letters as i32);
+        }
+        1.0 / p.max(1e-300)
+    }
+
+    /// 规则文本描述（如"前缀 ab + 后缀 88"，供启动摘要）
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(f) = &self.front {
+            parts.push(format!("前缀 {}", String::from_utf8_lossy(f)));
+        }
+        if let Some(m) = &self.middle_raw {
+            parts.push(format!("包含 {}", String::from_utf8_lossy(m)));
+        }
+        if let Some(b) = &self.back {
+            parts.push(format!("后缀 {}", String::from_utf8_lossy(b)));
+        }
+        parts.join(" + ")
     }
 }
 
@@ -207,5 +257,29 @@ mod tests {
     fn 大小写敏感_数字不受影响() {
         let m = Matcher::new(true, Some(b"8888".to_vec()), None, None);
         assert!(m.matches(HEX40, Some(HEX40)));
+    }
+
+    /// 期望尝试次数估算
+    #[test]
+    fn 期望次数_估算() {
+        // 2 位前缀 → 256
+        let m = Matcher::new(false, Some(b"ab".to_vec()), None, None);
+        assert!((m.expected_attempts() - 256.0).abs() < 1e-6);
+        // 4 位前缀 → 65536
+        let m = Matcher::new(false, Some(b"8888".to_vec()), None, None);
+        assert!((m.expected_attempts() - 65_536.0).abs() < 1e-3);
+        // 前缀+后缀联合 → 16^8
+        let m = Matcher::new(false, Some(b"8888".to_vec()), None, Some(b"8888".to_vec()));
+        assert!((m.expected_attempts() - 16f64.powf(8.0)).abs() < 1e6);
+        // 大小写敏感 4 字母前缀 → 16^4 × 2^4
+        let m = Matcher::new(true, Some(b"AaBb".to_vec()), None, None);
+        assert!((m.expected_attempts() - 16f64.powf(4.0) * 16.0).abs() < 1e-3);
+    }
+
+    /// 规则文本描述
+    #[test]
+    fn 规则描述() {
+        let m = Matcher::new(false, Some(b"ab".to_vec()), Some(b"77".to_vec()), Some(b"88".to_vec()));
+        assert_eq!(m.describe(), "前缀 ab + 包含 77 + 后缀 88");
     }
 }

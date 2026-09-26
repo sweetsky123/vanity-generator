@@ -54,6 +54,37 @@ gpg_key_file: "fx1024.asc"
 命中后生成的 `vanity_日期_时间_序号.asc` 是 ASCII Armor 加密文件，可在任何装有
 GnuPG 的机器上解密：`gpg --decrypt vanity_xxx.asc > wallet.txt`。
 
+只想验证配置而不开始搜索：`./vanity-generator --check`，会输出规则难度预估
+（期望尝试次数与参考耗时），难度过高会直接提示。
+
+## CI 多机并行演示
+
+仓库自带手动触发的多机并行工作流（Actions → 靓号演示（多机并行）→ Run workflow）：
+
+1. 在仓库 Settings → Secrets and variables → Actions 配置两个 Secret：
+   - `config`：config.yaml 的完整内容
+   - `gpg`：GPG 公钥 armor 的完整内容
+2. 触发时可选：**并行机器数**（1-20，默认 8）与每台机器的搜索时限（默认 15 分钟）
+3. 每台机器独立全速搜索同一规则；任一台找齐全部数量后，其余机器会通过
+   轮询本运行的任务状态自动提前停止（已命中的部分产物仍会计入）
+4. 结束后所有加密产物与各机器运行日志聚合发布到 Release（`demo-run-<运行编号>`）
+
+注意：规则难度请控制在演示时限内可完成的范围（启动日志会打印"期望尝试"一行，
+也可以先在本地用 `--check` 预估）。参考：单机约 450 次/秒，8 台机器并行时
+4 位前缀（期望 6.5 万次）秒级完成，5 位（约 100 万次）数分钟，6 位起建议大幅延长时间。
+
+## 常见问题
+
+- **演示一直不命中**：先看该次运行 Release 里的 machine-1.log 中"期望尝试"一行；
+  若参考耗时远超时限，属规则过难，请缩短前/后缀或加长时限。
+- **规则难度怎么估**：前缀/后缀每多一位 hex 字符，期望次数 ×16；
+  大小写敏感时每个字母位再 ×2；前缀与后缀叠加相乘。
+- **如何生成自己的 GPG 公钥**：`gpg --armor --export 你的邮箱 > mykey.asc`，
+  把文件内容整个放进 `gpg` Secret 或与二进制同目录。
+- **Windows**：解压 zip 后，把 config.example.yaml 改名为 config.yaml，
+  与 vanity-generator.exe 放同一目录再运行（或在 PowerShell 里 `.\vanity-generator.exe --check` 验证）。
+- **进度行没有出现**：确认 config 里 `progress_every` 为正整数（如 1000），`false` 为关闭。
+
 ## 工作原理
 
 ```mermaid

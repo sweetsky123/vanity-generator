@@ -1,39 +1,70 @@
-name: 靓号演示
+name: 靓号演示（多机并行）
 
-# 手动触发：使用仓库 Secrets 中的 `config`（config.yaml 内容）与
-# `gpg`（GPG 公钥 armor 内容）运行一次靓号搜索，
-# 生成的加密文件随本次运行发布到 Release（demo-run-<编号>）。
+# 手动触发的多机并行演示：
+# - 使用仓库 Secrets 中的 `config`（config.yaml 内容）与 `gpg`（公钥 armor）；
+# - `machines` 输入选择并行机器数（1..20，默认 8）；
+# - 每台机器独立全速搜索相同规则，任何一台完成全部数量后，
+#   其余机器通过轮询 API 检测到并提前停止（已命中的部分产物仍会计入）；
+# - 全部机器结束后统一聚合产物发布 Release（demo-run-<运行编号>）。
+#
+# 说明：跨机器的实时协调无法用 GitHub 原生机制（无跨 job 信号），
+# 本工作流采用"轮询本 run 的 job 状态"实现提前停止，属原生兼容方案。
 on:
   workflow_dispatch:
     inputs:
+      machines:
+        description: 并行机器数（1-20）
+        required: false
+        default: "8"
       timeout_minutes:
-        description: 单次运行超时（分钟），超时后已有的加密文件仍会上传
+        description: 每台机器的搜索时限（分钟）
         required: false
         default: "15"
 
 permissions:
   contents: write
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  demo:
-    name: 运行靓号搜索
+  setup:
+    name: 参数准备
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - name: 生成矩阵
+        id: gen
+        env:
+          CFG: ${{ secrets.config }}
+          GPG: ${{ secrets.gpg }}
+        run: |
+          if [ -z "$CFG" ]; then
+            echo "::error::仓库 Secrets 缺少 config（config.yaml 内容）。请到 Settings → Secrets and variables → Actions 添加。"; exit 1
+          fi
+          if [ -z "$GPG" ]; then
+            echo "::error::仓库 Secrets 缺少 gpg（GPG 公钥 armor 内容）。请到 Settings → Secrets and variables → Actions 添加。"; exit 1
+          fi
+          N=$(printf '%s' "${{ inputs.machines || '8' }}" | tr -cd '0-9')
+          [ -z "$N" ] && N=8
+          if [ "$N" -lt 1 ] || [ "$N" -gt 20 ]; then
+            echo "::error::机器数必须在 1-20 之间（当前 $N）。"; exit 1
+          fi
+          echo "matrix=$(seq -s, 1 "$N" | sed 's/^/[/;s/$/]/')" >> "$GITHUB_OUTPUT"
+
+  search:
+    name: 搜索 (${{ matrix.machine }}/${{ strategy.job-total }})
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: ${{ fromJSON(needs.setup.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: 检查 Secrets 是否已配置
-        shell: bash
-        run: |
-          if [ -z "${{ secrets.config }}" ]; then
-            echo "::error::仓库 Secrets 缺少 `config`（config.yaml 内容）。请到 Settings → Secrets and variables → Actions 添加。"; exit 1
-          fi
-          if [ -z "${{ secrets.gpg }}" ]; then
-            echo "::error::仓库 Secrets 缺少 `gpg`（GPG 公钥 armor 内容）。请到 Settings → Secrets and variables → Actions 添加。"; exit 1
-          fi
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
@@ -44,40 +75,88 @@ jobs:
       - name: 构建
         run: cargo build --release
 
-      - name: 运行（配置与公钥均通过环境变量注入）
-        id: run
-        timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || '15') }}
-        shell: bash
+      - name: 运行搜索（环境变量注入配置与公钥；其他机器完成后自动停止）
         env:
           VANITY_CONFIG: ${{ secrets.config }}
           VANITY_GPG_KEY: ${{ secrets.gpg }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir demo && cp target/release/vanity-generator demo/
+          mkdir -p demo && cp target/release/vanity-generator demo/
           cd demo
-          ./vanity-generator 2>&1 | tee run.log
-          echo "hits=$(ls vanity_*.asc 2>/dev/null | wc -l)" >> "$GITHUB_OUTPUT"
+          TM=$(printf '%s' "${{ inputs.timeout_minutes || '15' }}" | tr -cd '0-9')
+          [ -z "$TM" ] && TM=15
+          echo "机器 ${{ matrix.machine }}/${{ strategy.job-total }} 开始搜索（时限 ${TM} 分钟）"
+          ./vanity-generator > run.log 2>&1 &
+          BIN=$!
+          DEADLINE=$(( $(date +%s) + TM * 60 ))
+          while kill -0 "$BIN" 2>/dev/null; do
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "达到时限，停止本机搜索（已命中的产物仍会上传）"
+              kill "$BIN" 2>/dev/null || true
+              break
+            fi
+            DONE=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
+              --jq '[.jobs[] | select(.name | startswith("搜索")) | select(.conclusion == "success")] | length' 2>/dev/null || echo 0)
+            if [ "${DONE:-0}" -ge 1 ]; then
+              echo "检测到其他机器已完成全部目标数量，本机提前停止"
+              kill "$BIN" 2>/dev/null || true
+              break
+            fi
+            sleep 15
+          done
+          wait "$BIN" 2>/dev/null || true
+          echo "=== 本机运行日志（尾部） ==="
+          tail -20 run.log || true
 
-      - name: 汇总加密产物（超时/未命中时也可能有部分产物）
+      - name: 上传本机产物
         if: always()
-        shell: bash
-        run: |
-          mkdir -p release-assets || true
-          cp demo/vanity_*.asc release-assets/ 2>/dev/null || true
-          cp demo/run.log release-assets/ 2>/dev/null || true
-          ls -la release-assets/ || true
+        uses: actions/upload-artifact@v4
+        with:
+          name: hits-machine-${{ matrix.machine }}
+          path: |
+            demo/run.log
+            demo/vanity_*.asc
+          if-no-files-found: ignore
 
-      - name: 发布 Release（demo-run-<编号>）
-        if: always()
+  publish:
+    name: 聚合并发布 Release
+    needs: [setup, search]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载全部机器产物
+        uses: actions/download-artifact@v4
+        with:
+          path: all-hits
+          pattern: hits-machine-*
+          merge-multiple: false
+
+      - name: 聚合与发布
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if compgen -G "release-assets/*" > /dev/null; then
-            gh release create "demo-run-${GITHUB_RUN_NUMBER}" \
-              --title "靓号演示 · 第 ${GITHUB_RUN_NUMBER} 次运行" \
-              --notes "加密产物由仓库 Secrets 中的公钥加密，仅持对应私钥者可解密。运行日志见 release-assets。" \
-              release-assets/* || \
+          mkdir -p release-assets
+          find all-hits -type f -name 'vanity_*.asc' -exec cp {} release-assets/ \; 2>/dev/null || true
+          find all-hits -type f -name 'run.log' -exec sh -c 'cp "$1" "release-assets/machine-$(echo "$1" | grep -oE "machine-[0-9]+").log"' _ {} \; 2>/dev/null || true
+          HITS=$(ls release-assets/vanity_*.asc 2>/dev/null | wc -l)
+          echo "总命中数：$HITS"
+          EXPECT=$(grep -h "期望尝试" all-hits/hits-machine-1/run.log 2>/dev/null | head -1 || true)
+          echo "规则难度：${EXPECT:-（见各机器日志）}"
+          {
+            echo "## 靓号演示 · 第 ${GITHUB_RUN_NUMBER} 次运行"
+            echo ""
+            echo "- 并行机器：${{ inputs.machines || '8' }} 台"
+            echo "- 总命中：${HITS} 个加密文件"
+            echo "- ${EXPECT}"
+            echo "- 加密产物仅持对应 GPG 私钥者可解密；各机器运行日志见附件 machine-*.log"
+          } > notes.md
+          cat notes.md
+          if [ "$HITS" -ge 1 ]; then
+            gh release create "demo-run-${GITHUB_RUN_NUMBER}" --title "靓号演示 · 第 ${GITHUB_RUN_NUMBER} 次运行（${{ inputs.machines || '8' }} 机并行）" --notes-file notes.md release-assets/* || \
             gh release upload "demo-run-${GITHUB_RUN_NUMBER}" release-assets/* --clobber
+            echo "已发布 Release：demo-run-${GITHUB_RUN_NUMBER}"
           else
-            echo "本次运行没有产出加密文件（超时或未命中）。"
+            gh release create "demo-run-${GITHUB_RUN_NUMBER}" --title "靓号演示 · 第 ${GITHUB_RUN_NUMBER} 次运行（未命中）" --notes-file notes.md release-assets/* || true
+            echo "本次未在时限内命中。若规则难度高（期望尝试次数见上），请缩短前/后缀或延长时间。"
           fi

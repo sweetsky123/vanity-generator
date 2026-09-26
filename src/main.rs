@@ -39,6 +39,9 @@ struct Cli {
     /// 指定 config.yaml 路径（默认：可执行文件同目录，或环境变量 VANITY_CONFIG 内容）
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
+    /// 仅校验配置与公钥并输出摘要（含期望尝试次数预估），不开始搜索
+    #[arg(long)]
+    check: bool,
 }
 
 fn main() -> ExitCode {
@@ -86,7 +89,13 @@ fn run() -> Result<()> {
     let encryptor = GpgEncryptor::from_bytes(&gpg_data)?;
 
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    print_startup(&cfg, &encryptor, threads, &exe_dir);
+    print_startup(&cfg, &matcher, &encryptor, threads, &exe_dir);
+
+    // --check：校验通过即退出（不开始搜索）
+    if cli.check {
+        println!("配置校验通过（--check）：config 与公钥均可用，未开始搜索。");
+        return Ok(());
+    }
 
     // 3. 并行调度
     let started = Instant::now();
@@ -240,22 +249,18 @@ fn exe_dir() -> Result<PathBuf> {
 }
 
 /// 启动信息（中文；不输出任何敏感内容）
-fn print_startup(cfg: &Config, encryptor: &GpgEncryptor, threads: usize, exe_dir: &std::path::Path) {
+fn print_startup(
+    cfg: &Config,
+    matcher: &Matcher,
+    encryptor: &GpgEncryptor,
+    threads: usize,
+    exe_dir: &std::path::Path,
+) {
     let entropy_bits = match cfg.word_count {
         12 => 128,
         18 => 192,
         _ => 256,
     };
-    let mut rule = Vec::new();
-    if let Some(f) = &cfg.front {
-        rule.push(format!("前缀 {}", String::from_utf8_lossy(f)));
-    }
-    if let Some(m) = &cfg.middle {
-        rule.push(format!("中缀 {}", String::from_utf8_lossy(m)));
-    }
-    if let Some(b) = &cfg.back {
-        rule.push(format!("后缀 {}", String::from_utf8_lossy(b)));
-    }
     println!("===== vanity-generator 启动 =====");
     println!(
         "助记词长度 : {} 词（{} 位熵）",
@@ -263,9 +268,20 @@ fn print_startup(cfg: &Config, encryptor: &GpgEncryptor, threads: usize, exe_dir
     );
     println!(
         "靓号规则   : {}（大小写敏感：{}）",
-        rule.join(" + "),
+        matcher.describe(),
         if cfg.case_sensitive { "是" } else { "否" }
     );
+    // 期望尝试次数与参考耗时（单机速率按保守 400/s 估算，多核更快）
+    let expected = matcher.expected_attempts();
+    let est_secs = expected / 400.0;
+    println!(
+        "期望尝试   : 约 {}（参考耗时：单机约 {}）",
+        fmt_count(expected),
+        fmt_duration(est_secs)
+    );
+    if est_secs > 3600.0 * 24.0 {
+        println!("提示       : 规则较难，单机预计超过一天；建议缩短规则或使用多机并行演示工作流。");
+    }
     println!(
         "派生路径   : {}（{} 层，其中 hardened {} 层）",
         cfg.path,
@@ -295,4 +311,32 @@ fn print_startup(cfg: &Config, encryptor: &GpgEncryptor, threads: usize, exe_dir
     );
     println!("工作线程   : {threads}");
     println!("输出目录   : {}", exe_dir.display());
+}
+
+/// 人类可读的大数字（256 / 6.6万 / 43亿 / 1.2e15）
+fn fmt_count(n: f64) -> String {
+    if n < 1e4 {
+        format!("{}", n.round() as u64)
+    } else if n < 1e8 {
+        format!("{:.1} 万", n / 1e4)
+    } else if n < 1e12 {
+        format!("{:.1} 亿", n / 1e8)
+    } else {
+        format!("{:.2e}", n)
+    }
+}
+
+/// 人类可读的时长（秒/分/时/天）
+fn fmt_duration(secs: f64) -> String {
+    if secs < 60.0 {
+        format!("{:.0} 秒", secs)
+    } else if secs < 3600.0 {
+        format!("{:.1} 分钟", secs / 60.0)
+    } else if secs < 86_400.0 {
+        format!("{:.1} 小时", secs / 3600.0)
+    } else if secs < 86_400.0 * 365.0 {
+        format!("{:.1} 天", secs / 86_400.0)
+    } else {
+        format!("{:.1} 年", secs / (86_400.0 * 365.0))
+    }
 }
