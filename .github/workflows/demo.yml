@@ -1,14 +1,22 @@
-name: 靓号演示（多机并行）
+name: 靓号演示（多机并行·共同目标）
 
-# 手动触发的多机并行演示：
+# 手动触发的多机并行演示（v3：共同目标机制）：
+#
 # - 使用仓库 Secrets 中的 `config`（config.yaml 内容）与 `gpg`（公钥 armor）；
 # - `machines` 输入选择并行机器数（1..20，默认 8）；
-# - 每台机器独立全速搜索相同规则，任何一台完成全部数量后，
-#   其余机器通过轮询 API 检测到并提前停止（已命中的部分产物仍会计入）；
-# - 全部机器结束后统一聚合产物发布 Release（demo-run-<运行编号>）。
+# - 共同目标：以固定的 prerelease Release（demo-latest）资产作为全局命中
+#   计数器。每台机器命中一个地址后立即把加密产物上传到该 Release，
+#   全部机器每 5 秒轮询全局命中数，达到 config 中的目标数量即停止本机
+#   进程（在途的少量超额命中仍会计入并保留）；
+# - 机器按序号错峰启动（8 秒 × 序号）：低难度场景下先启动的机器可先完成
+#   全部目标，后启动的机器直接空转跳过，实现"精确停在目标数量"；
+#   高难度场景下错峰损耗可忽略；
+# - 演示 Release 固定为 prerelease 标记（永不占用 Latest），且只复用
+#   demo-latest 一个标签，不随运行次数堆积标签；
+# - 全部机器结束后统一整理 Release 标题/说明并附各机器运行日志。
 #
 # 说明：跨机器的实时协调无法用 GitHub 原生机制（无跨 job 信号），
-# 本工作流采用"轮询本 run 的 job 状态"实现提前停止，属原生兼容方案。
+# 本工作流以"Release 资产计数 + 轮询"实现，属原生兼容方案。
 on:
   workflow_dispatch:
     inputs:
@@ -23,7 +31,6 @@ on:
 
 permissions:
   contents: write
-  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,133 +40,184 @@ jobs:
     name: 参数准备
     runs-on: ubuntu-latest
     outputs:
+      count: ${{ steps.cfg.outputs.count }}
       matrix: ${{ steps.gen.outputs.matrix }}
+      machines: ${{ steps.gen.outputs.machines }}
     steps:
-      - name: 生成矩阵
-        id: gen
+      - name: 检查 Secrets 是否已配置
         env:
           CFG: ${{ secrets.config }}
           GPG: ${{ secrets.gpg }}
         run: |
           if [ -z "$CFG" ]; then
-            echo "::error::仓库 Secrets 缺少 config（config.yaml 内容）。请到 Settings → Secrets and variables → Actions 添加。"; exit 1
+            echo "::error::仓库 Secrets 缺少 config（config.yaml 内容）。请到 Settings → Secrets and variables → Actions 添加。"
+            exit 1
           fi
           if [ -z "$GPG" ]; then
-            echo "::error::仓库 Secrets 缺少 gpg（GPG 公钥 armor 内容）。请到 Settings → Secrets and variables → Actions 添加。"; exit 1
+            echo "::error::仓库 Secrets 缺少 gpg（GPG 公钥 armor 内容）。请到 Settings → Secrets and variables → Actions 添加。"
+            exit 1
           fi
-          N=$(printf '%s' "${{ inputs.machines || '8' }}" | tr -cd '0-9')
-          [ -z "$N" ] && N=8
-          if [ "$N" -lt 1 ] || [ "$N" -gt 20 ]; then
-            echo "::error::机器数必须在 1-20 之间（当前 $N）。"; exit 1
-          fi
-          echo "matrix=$(seq -s, 1 "$N" | sed 's/^/[/;s/$/]/')" >> "$GITHUB_OUTPUT"
 
-  search:
-    name: 搜索 (${{ matrix.machine }}/${{ strategy.job-total }})
-    needs: setup
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        machine: ${{ fromJSON(needs.setup.outputs.matrix) }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: 安装 Rust 工具链
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: 缓存依赖
-        uses: Swatinem/rust-cache@v2
-
-      - name: 构建
-        run: cargo build --release
-
-      - name: 运行搜索（环境变量注入配置与公钥；其他机器完成后自动停止）
+      - name: 解析目标数量
+        id: cfg
         env:
-          VANITY_CONFIG: ${{ secrets.config }}
-          VANITY_GPG_KEY: ${{ secrets.gpg }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CFG: ${{ secrets.config }}
         run: |
-          mkdir -p demo && cp target/release/vanity-generator demo/
-          cd demo
-          TM=$(printf '%s' "${{ inputs.timeout_minutes || '15' }}" | tr -cd '0-9')
-          [ -z "$TM" ] && TM=15
-          echo "机器 ${{ matrix.machine }}/${{ strategy.job-total }} 开始搜索（时限 ${TM} 分钟）"
-          ./vanity-generator > run.log 2>&1 &
-          BIN=$!
-          DEADLINE=$(( $(date +%s) + TM * 60 ))
-          while kill -0 "$BIN" 2>/dev/null; do
-            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-              echo "达到时限，停止本机搜索（已命中的产物仍会上传）"
-              kill "$BIN" 2>/dev/null || true
-              break
-            fi
-            DONE=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
-              --jq '[.jobs[] | select(.name | startswith("搜索")) | select(.conclusion == "success")] | length' 2>/dev/null || echo 0)
-            if [ "${DONE:-0}" -ge 1 ]; then
-              echo "检测到其他机器已完成全部目标数量，本机提前停止"
-              kill "$BIN" 2>/dev/null || true
-              break
-            fi
-            sleep 15
-          done
-          wait "$BIN" 2>/dev/null || true
-          echo "=== 本机运行日志（尾部） ==="
-          tail -20 run.log || true
+          printf '%s\n' "$CFG" > config.yaml
+          COUNT=$(ruby -ryaml -e 'c = YAML.load_file("config.yaml"); puts c["count"].to_i' 2>/dev/null || true)
+          if ! [ "$COUNT" -ge 1 ] 2>/dev/null; then
+            COUNT=$(grep -E '^count:' config.yaml | head -1 | awk '{print $2}' | tr -d '"' || true)
+          fi
+          if ! [ "$COUNT" -ge 1 ] 2>/dev/null; then COUNT=1; fi
+          echo "目标数量：$COUNT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
 
-      - name: 上传本机产物
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hits-machine-${{ matrix.machine }}
-          path: |
-            demo/run.log
-            demo/vanity_*.asc
-          if-no-files-found: ignore
-
-  publish:
-    name: 聚合并发布 Release
-    needs: [setup, search]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: 下载全部机器产物
-        uses: actions/download-artifact@v4
-        with:
-          path: all-hits
-          pattern: hits-machine-*
-          merge-multiple: false
-
-      - name: 聚合与发布
-        shell: bash
+      - name: 生成矩阵并初始化演示 Release
+        id: gen
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
-          mkdir -p release-assets
-          find all-hits -type f -name 'vanity_*.asc' -exec cp {} release-assets/ \; 2>/dev/null || true
-          for d in all-hits/hits-machine-*; do
-            [ -f "$d/run.log" ] && cp "$d/run.log" "release-assets/$(basename "$d").log" || true
+          N=${{ inputs.machines || '8' }}
+          if ! [ "$N" -ge 1 ] 2>/dev/null; then N=1; fi
+          if [ "$N" -gt 20 ]; then N=20; fi
+          MATRIX=$(seq 1 "$N" | sed 's/^/"/;s/$/"/' | paste -sd, - | sed 's/^/[/;s/$/]/')
+          echo "矩阵：$MATRIX"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "machines=$N" >> "$GITHUB_OUTPUT"
+          # 固定单一 prerelease 标签 demo-latest：不存在则创建，存在则清空旧资产（全局计数归零）
+          if ! gh release view demo-latest > /dev/null 2>&1; then
+            gh release create demo-latest --prerelease --title "靓号演示（多机并行）" --notes "初始化（自动创建）" || true
+          fi
+          for AID in $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/demo-latest" --jq '.assets[].id' 2>/dev/null); do
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$AID" || true
           done
-          HITS=$(ls release-assets/vanity_*.asc 2>/dev/null | wc -l)
-          echo "总命中数：$HITS"
-          EXPECT=$(grep -h "期望尝试" all-hits/hits-machine-1/run.log 2>/dev/null | head -1 || true)
+          echo "demo-latest 资产已清空，全局命中计数从 0 开始"
+
+  search:
+    name: 搜索 (${{ matrix.machine }}/${{ needs.setup.outputs.machines }})
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 缓存依赖
+        uses: Swatinem/rust-cache@v2
+      - name: 编译（release）
+        run: cargo build --release
+
+      - name: 搜索（共同目标：达标即停）
+        shell: bash
+        env:
+          VANITY_CONFIG: ${{ secrets.config }}
+          VANITY_GPG_KEY: ${{ secrets.gpg }}
+          TARGET: ${{ needs.setup.outputs.count }}
+          MACHINE: ${{ matrix.machine }}
+        run: |
+          set -u
+          M="$MACHINE"
+          TARGET="$TARGET"
+          TM=${{ inputs.timeout_minutes || '15' }}
+          echo "机器 $M：共同目标 $TARGET 个地址，本机时限 ${TM} 分钟"
+
+          # 错峰启动：8 秒 × (序号-1)。低难度下先机可独立完成全部目标，
+          # 后启动的机器轮询到达标后直接跳过搜索；高难度下损耗可忽略。
+          DELAY=$(( (M-1)*8 ))
+          [ "$DELAY" -gt 0 ] && echo "错峰延迟 ${DELAY}s" && sleep "$DELAY"
+
+          hits_on_release() {
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/demo-latest" \
+              --jq '[.assets[].name | select(test("^m[0-9]+-vanity_"))] | length' 2>/dev/null || echo -1
+          }
+
+          # 达标即可直接跳过搜索（后启动机器的快速通道）
+          if [ "$(hits_on_release)" -ge "$TARGET" ]; then
+            echo "共同目标已由先启机器完成，本机无需搜索"
+            exit 0
+          fi
+
+          ./vanity-generator > run.log 2>&1 &
+          BIN=$!
+          uploaded=""
+          upload_new_hits() {
+            for f in vanity_*.asc; do
+              [ -f "$f" ] || continue
+              case " $uploaded " in *" $f "*) continue ;; esac
+              if gh release upload demo-latest "$f#m${M}-$(basename "$f")" --clobber; then
+                uploaded="$uploaded $f"
+                echo "已上报命中：$(basename "$f")"
+              fi
+            done
+          }
+
+          start=$SECONDS
+          while kill -0 "$BIN" 2>/dev/null; do
+            upload_new_hits
+            G=$(hits_on_release)
+            if [ "$G" -ge "$TARGET" ]; then
+              echo "共同目标达成（全局 $G/$TARGET），本机提前停止"
+              kill "$BIN"; break
+            fi
+            if [ $(( SECONDS - start )) -ge $(( TM * 60 )) ]; then
+              echo "达到本机时限 ${TM} 分钟，停止（已命中部分仍保留）"
+              kill "$BIN"; break
+            fi
+            sleep 5
+          done
+          wait "$BIN" 2>/dev/null || true
+          upload_new_hits
+          gh release upload demo-latest "run.log#log-machine-${M}.log" --clobber || true
+          echo "===== 本机运行日志（尾部） ====="
+          tail -n 8 run.log
+
+      - name: 构建产物检查（防路径遗漏）
+        if: always()
+        run: ls -la vanity_*.asc 2>/dev/null || echo "（本机无命中文件——可能被共同目标提前停止或未命中）"
+
+  publish:
+    name: 整理发布
+    needs: [setup, search]
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: 汇总与整理
+        run: |
+          TARGET=${{ needs.setup.outputs.count }}
+          HITS=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/demo-latest" \
+            --jq '[.assets[].name | select(test("^m[0-9]+-vanity_"))] | length' 2>/dev/null || echo -1)
+          echo "共同目标：$TARGET；全局命中：$HITS"
+          # 下载 1 号机日志提取难度提示（如有）
+          EXPECT=""
+          if gh release download demo-latest --pattern 'log-machine-*.log' --dir logs 2>/dev/null; then
+            EXPECT=$(grep -h "期望尝试" logs/log-machine-*.log 2>/dev/null | head -1 || true)
+          fi
           echo "规则难度：${EXPECT:-（见各机器日志）}"
+          STATUS="已完成共同目标"
+          [ "$HITS" -lt "$TARGET" ] && STATUS="未在时限内完成共同目标（$HITS/$TARGET）"
           {
-            echo "## 靓号演示 · 第 ${GITHUB_RUN_NUMBER} 次运行"
+            echo "## 靓号演示（多机并行·共同目标）· 第 ${GITHUB_RUN_NUMBER} 次运行"
             echo ""
-            echo "- 并行机器：${{ inputs.machines || '8' }} 台"
-            echo "- 总命中：${HITS} 个加密文件"
+            echo "- 并行机器：${{ inputs.machines || '8' }} 台（错峰启动 8s/台）"
+            echo "- 共同目标：$TARGET 个地址（全部机器达标即停）"
+            echo "- 状态：$STATUS"
             echo "- ${EXPECT}"
-            echo "- 加密产物仅持对应 GPG 私钥者可解密；各机器运行日志见附件 machine-*.log"
+            echo "- 加密产物仅持对应 GPG 私钥者可解密；各机器运行日志见附件 log-machine-*.log"
+            echo "- 本 Release 为预发布（prerelease），固定复用 demo-latest 标签，不占用 Latest"
           } > notes.md
           cat notes.md
-          if [ "$HITS" -ge 1 ]; then
-            gh release create "demo-run-${GITHUB_RUN_NUMBER}" --title "靓号演示 · 第 ${GITHUB_RUN_NUMBER} 次运行（${{ inputs.machines || '8' }} 机并行）" --notes-file notes.md release-assets/* || \
-            gh release upload "demo-run-${GITHUB_RUN_NUMBER}" release-assets/* --clobber
-            echo "已发布 Release：demo-run-${GITHUB_RUN_NUMBER}"
-          else
-            gh release create "demo-run-${GITHUB_RUN_NUMBER}" --title "靓号演示 · 第 ${GITHUB_RUN_NUMBER} 次运行（未命中）" --notes-file notes.md release-assets/* || true
-            echo "本次未在时限内命中。若规则难度高（期望尝试次数见上），请缩短前/后缀或延长时间。"
+          gh release edit demo-latest \
+            --title "靓号演示（多机并行·共同目标）· 第 ${GITHUB_RUN_NUMBER} 次运行" \
+            --notes-file notes.md --prerelease
+          if [ "$HITS" -lt 1 ]; then
+            echo "本次未命中：规则可能过难，参考上方难度提示调整 front/back 或延长时间。"
           fi
