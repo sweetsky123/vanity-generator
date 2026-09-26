@@ -1,0 +1,39 @@
+[package]
+name = "buffered-reader"
+description = "A super-powered Reader"
+version = "1.4.1"
+authors = [
+    "Justus Winter <justus@sequoia-pgp.org>",
+    "Kai Michaelis <kai@sequoia-pgp.org>",
+    "Neal H. Walfield <neal@sequoia-pgp.org>",
+]
+documentation = "https://docs.rs/buffered-reader"
+homepage = "https://sequoia-pgp.org/"
+repository = "https://gitlab.com/sequoia-pgp/sequoia"
+readme = "README.md"
+license = "LGPL-2.0-or-later"
+edition = "2021"
+rust-version.workspace = true
+
+[badges]
+gitlab = { repository = "sequoia-pgp/sequoia" }
+maintenance = { status = "actively-developed" }
+
+[dependencies]
+bzip2 = { version = ">= 0.4, < 0.7", optional = true }
+flate2 = { version = "1.0.1", optional = true }
+libc = "0.2.66"
+
+[lib]
+bench = false
+
+[features]
+default = ["compression"]
+
+# The compression algorithms.
+compression = ["compression-deflate", "compression-bzip2"]
+compression-deflate = ["flate2"]
+compression-bzip2 = ["bzip2"]
+
+[lints]
+workspace = true
