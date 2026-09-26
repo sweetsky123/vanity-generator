@@ -41,6 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       count: ${{ steps.cfg.outputs.count }}
+      stagger: ${{ steps.cfg.outputs.stagger }}
       matrix: ${{ steps.gen.outputs.matrix }}
       machines: ${{ steps.gen.outputs.machines }}
     steps:
@@ -58,19 +59,45 @@ jobs:
             exit 1
           fi
 
-      - name: 解析目标数量
+      - name: 解析目标数量与错峰参数
         id: cfg
         env:
           CFG: ${{ secrets.config }}
         run: |
           printf '%s\n' "$CFG" > config.yaml
-          COUNT=$(ruby -ryaml -e 'c = YAML.load_file("config.yaml"); puts c["count"].to_i' 2>/dev/null || true)
+          # count + 自适应错峰：按规则难度估算单机完成全量目标的时长，
+          # 错峰 = 时长 ×2（上限 30 秒）。低难度 → 后启机器走快速通道跳过，
+          # 总命中精确停在目标；高难度 → 错峰相对搜索时长可忽略。
+          READS=$(ruby -ryaml -e '
+            c = YAML.load_file("config.yaml")
+            count = c["count"].to_i
+            front = (c["front"] || "").to_s.sub(/^0x/i, "")
+            back  = (c["back"]  || "").to_s.sub(/^0x/i, "")
+            mid   = (c["middle"] || "").to_s
+            exp = 16.0 ** (front.size + back.size)
+            letters = (front + mid + back).chars.count { |ch| ch =~ /[a-zA-Z]/ }
+            exp *= 2.0 ** letters if c["case_sensitive"]
+            unless mid.empty?
+              n = mid.size
+              exp *= 16.0 ** n / [(41 - n), 1].max
+            end
+            # 单机速率保守按 1800 次/秒（4 线程 × 450）
+            stagger = [count * exp / 1800.0 * 2, 30].min.ceil
+            stagger = 3 if stagger < 3
+            puts "count=#{count}"
+            puts "stagger=#{stagger}"
+            puts "expected=#{exp.round}"
+          ' 2>/dev/null || true)
+          COUNT=$(printf '%s\n' "$READS" | sed -n 's/^count=//p' | head -1)
+          STAGGER=$(printf '%s\n' "$READS" | sed -n 's/^stagger=//p' | head -1)
           if ! [ "$COUNT" -ge 1 ] 2>/dev/null; then
             COUNT=$(grep -E '^count:' config.yaml | head -1 | awk '{print $2}' | tr -d '"' || true)
           fi
           if ! [ "$COUNT" -ge 1 ] 2>/dev/null; then COUNT=1; fi
-          echo "目标数量：$COUNT"
+          if ! [ "$STAGGER" -ge 1 ] 2>/dev/null; then STAGGER=8; fi
+          echo "目标数量：$COUNT，错峰间隔：${STAGGER}s"
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "stagger=$STAGGER" >> "$GITHUB_OUTPUT"
 
       - name: 生成矩阵并初始化演示 Release
         id: gen
@@ -124,13 +151,15 @@ jobs:
           set -u
           M="$MACHINE"
           TARGET="$TARGET"
+          STAGGER=${{ needs.setup.outputs.stagger }}
           TM=${{ inputs.timeout_minutes || '15' }}
-          echo "机器 $M：共同目标 $TARGET 个地址，本机时限 ${TM} 分钟"
+          echo "机器 $M：共同目标 $TARGET 个地址，本机时限 ${TM} 分钟，错峰间隔 ${STAGGER}s"
           mkdir -p /tmp/out
 
-          # 错峰启动：8 秒 × (序号-1)。低难度下先机可独立完成全部目标，
-          # 后启动的机器轮询到达标后直接跳过搜索；高难度下损耗可忽略。
-          DELAY=$(( (M-1)*8 ))
+          # 自适应错峰：间隔 = 单机预计完成全量目标时长 ×2（上限 30s）。
+          # 低难度下先机可独立完成全部目标，后启动的机器轮询到达标后直接
+          # 跳过搜索，总命中精确停在目标数量；高难度下错峰损耗可忽略。
+          DELAY=$(( (M-1)*STAGGER ))
           [ "$DELAY" -gt 0 ] && echo "错峰延迟 ${DELAY}s" && sleep "$DELAY"
 
           hits_on_release() {
@@ -177,10 +206,12 @@ jobs:
               echo "达到本机时限 ${TM} 分钟，停止（已命中部分仍保留）"
               killed=1; kill "$BIN"; break
             fi
-            sleep 5
+            sleep 3
           done
-          wait "$BIN" 2>/dev/null
-          RC=$?
+          # 注意：GitHub 的 bash 默认 -e；被 kill 的进程 wait 返回 143，
+          # 必须用 || 捕获退出码，否则脚本会在这一行直接失败
+          RC=0
+          wait "$BIN" 2>/dev/null || RC=$?
           # 主动停止（协调/时限）视为正常；异常退出必须显式暴露，避免静默零命中
           if [ "$killed" = 0 ] && [ "$RC" != 0 ]; then
             echo "::error::vanity-generator 异常退出（退出码 $RC），日志尾部："
