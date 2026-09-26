@@ -59,45 +59,19 @@ jobs:
             exit 1
           fi
 
-      - name: 解析目标数量与错峰参数
+      - name: 解析目标数量
         id: cfg
         env:
           CFG: ${{ secrets.config }}
         run: |
           printf '%s\n' "$CFG" > config.yaml
-          # count + 自适应错峰：按规则难度估算单机完成全量目标的时长，
-          # 错峰 = 时长 ×2（上限 30 秒）。低难度 → 后启机器走快速通道跳过，
-          # 总命中精确停在目标；高难度 → 错峰相对搜索时长可忽略。
-          READS=$(ruby -ryaml -e '
-            c = YAML.load_file("config.yaml")
-            count = c["count"].to_i
-            front = (c["front"] || "").to_s.sub(/^0x/i, "")
-            back  = (c["back"]  || "").to_s.sub(/^0x/i, "")
-            mid   = (c["middle"] || "").to_s
-            exp = 16.0 ** (front.size + back.size)
-            letters = (front + mid + back).chars.count { |ch| ch =~ /[a-zA-Z]/ }
-            exp *= 2.0 ** letters if c["case_sensitive"]
-            unless mid.empty?
-              n = mid.size
-              exp *= 16.0 ** n / [(41 - n), 1].max
-            end
-            # 单机速率保守按 1800 次/秒（4 线程 × 450）
-            stagger = [count * exp / 1800.0 * 2, 30].min.ceil
-            stagger = 3 if stagger < 3
-            puts "count=#{count}"
-            puts "stagger=#{stagger}"
-            puts "expected=#{exp.round}"
-          ' 2>/dev/null || true)
-          COUNT=$(printf '%s\n' "$READS" | sed -n 's/^count=//p' | head -1)
-          STAGGER=$(printf '%s\n' "$READS" | sed -n 's/^stagger=//p' | head -1)
+          COUNT=$(ruby -ryaml -e 'c = YAML.load_file("config.yaml"); puts c["count"].to_i' 2>/dev/null || true)
           if ! [ "$COUNT" -ge 1 ] 2>/dev/null; then
             COUNT=$(grep -E '^count:' config.yaml | head -1 | awk '{print $2}' | tr -d '"' || true)
           fi
           if ! [ "$COUNT" -ge 1 ] 2>/dev/null; then COUNT=1; fi
-          if ! [ "$STAGGER" -ge 1 ] 2>/dev/null; then STAGGER=8; fi
-          echo "目标数量：$COUNT，错峰间隔：${STAGGER}s"
+          echo "目标数量：$COUNT"
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
-          echo "stagger=$STAGGER" >> "$GITHUB_OUTPUT"
 
       - name: 生成矩阵并初始化演示 Release
         id: gen
@@ -112,6 +86,38 @@ jobs:
           echo "矩阵：$MATRIX"
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           echo "machines=$N" >> "$GITHUB_OUTPUT"
+          # 自适应错峰（性能无损策略）：
+          # - 目标数 ≥ 2×机器数：错峰 = 0，全部机器零延迟并行（此情形下
+          #   在途超产占比天然 ≤ (N-1)/count，小到可忽略）
+          # - 目标数 < 2×机器数：错峰 = 单机预计完成全量目标时长 ×2.5
+          #   （上限 45s）。此情形总时长本身只有秒级～分钟级，
+          #   后启机器轮询到达标直接跳过 → 总命中精确停在目标数
+          COUNT=${{ needs.setup.outputs.count }}
+          STAGGER=$(ruby -ryaml -e '
+            c = YAML.load_file("config.yaml")
+            count = c["count"].to_i
+            front = (c["front"] || "").to_s.sub(/^0x/i, "")
+            back  = (c["back"]  || "").to_s.sub(/^0x/i, "")
+            mid   = (c["middle"] || "").to_s
+            exp = 16.0 ** (front.size + back.size)
+            letters = (front + mid + back).chars.count { |ch| ch =~ /[a-zA-Z]/ }
+            exp *= 2.0 ** letters if c["case_sensitive"]
+            unless mid.empty?
+              n = mid.size
+              exp *= 16.0 ** n / [(41 - n), 1].max
+            end
+            machines = ARGV[0].to_i
+            if count >= 2 * machines
+              puts 0
+            else
+              # 单机速率保守按 1800 次/秒（4 线程 × 450）
+              s = (count * exp / 1800.0 * 2.5).ceil
+              puts [s, 45].min
+            end
+          ' "$N" 2>/dev/null || true)
+          if ! [ "$STAGGER" -ge 0 ] 2>/dev/null; then STAGGER=8; fi
+          echo "错峰间隔：${STAGGER}s（0 = 全并行）"
+          echo "stagger=$STAGGER" >> "$GITHUB_OUTPUT"
           # 固定单一 prerelease 标签 demo-latest：不存在则创建，存在则清空旧资产（全局计数归零）
           if ! gh release view demo-latest > /dev/null 2>&1; then
             gh release create demo-latest --prerelease --title "靓号演示（多机并行）" --notes "初始化（自动创建）" || true
@@ -156,9 +162,8 @@ jobs:
           echo "机器 $M：共同目标 $TARGET 个地址，本机时限 ${TM} 分钟，错峰间隔 ${STAGGER}s"
           mkdir -p /tmp/out
 
-          # 自适应错峰：间隔 = 单机预计完成全量目标时长 ×2（上限 30s）。
-          # 低难度下先机可独立完成全部目标，后启动的机器轮询到达标后直接
-          # 跳过搜索，总命中精确停在目标数量；高难度下错峰损耗可忽略。
+          # 自适应错峰（性能无损）：目标数 ≥ 2×机器数时错峰为 0（全并行零损耗）；
+          # 目标数较少时按单机预计完成时长错峰，后启机器达标即跳过、精确停在目标数
           DELAY=$(( (M-1)*STAGGER ))
           [ "$DELAY" -gt 0 ] && echo "错峰延迟 ${DELAY}s" && sleep "$DELAY"
 
@@ -206,7 +211,11 @@ jobs:
               echo "达到本机时限 ${TM} 分钟，停止（已命中部分仍保留）"
               killed=1; kill "$BIN"; break
             fi
-            sleep 3
+            # 轮询间隔动态调整：前 60 秒 3s（低难度场景决胜期），之后 8s
+            # （控制 GITHUB_TOKEN API 用量：8 机 15 分钟全程 < 1000 次）
+            SLEEP=3
+            [ $(( SECONDS - start )) -ge 60 ] && SLEEP=8
+            sleep "$SLEEP"
           done
           # 注意：GitHub 的 bash 默认 -e；被 kill 的进程 wait 返回 143，
           # 必须用 || 捕获退出码，否则脚本会在这一行直接失败
