@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       count: ${{ steps.cfg.outputs.count }}
-      stagger: ${{ steps.cfg.outputs.stagger }}
+      stagger: ${{ steps.gen.outputs.stagger }}
       matrix: ${{ steps.gen.outputs.matrix }}
       machines: ${{ steps.gen.outputs.machines }}
     steps:
@@ -264,7 +264,9 @@ jobs:
           {
             echo "## 靓号演示（多机并行·共同目标）· 第 ${GITHUB_RUN_NUMBER} 次运行"
             echo ""
-            echo "- 并行机器：${{ inputs.machines || '8' }} 台（自适应错峰 ${STAGGER}s/台）"
+            STAG_MODE="全并行零错峰"
+            [ "$STAGGER" -gt 0 ] && STAG_MODE="自适应错峰 ${STAGGER}s/台"
+            echo "- 并行机器：${{ inputs.machines || '8' }} 台（${STAG_MODE}）"
             echo "- 共同目标：$TARGET 个地址（全部机器达标即停）"
             echo "- 状态：$STATUS"
             echo "- ${EXPECT}"
