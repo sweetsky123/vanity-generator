@@ -240,6 +240,7 @@ jobs:
       - name: 汇总与整理
         run: |
           TARGET=${{ needs.setup.outputs.count }}
+          STAGGER=${{ needs.setup.outputs.stagger }}
           HITS=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/demo-latest" \
             --jq '[.assets[].name | select(test("^m[0-9]+-vanity_"))] | length' 2>/dev/null || echo -1)
           echo "共同目标：$TARGET；全局命中：$HITS"
@@ -254,7 +255,7 @@ jobs:
           {
             echo "## 靓号演示（多机并行·共同目标）· 第 ${GITHUB_RUN_NUMBER} 次运行"
             echo ""
-            echo "- 并行机器：${{ inputs.machines || '8' }} 台（错峰启动 8s/台）"
+            echo "- 并行机器：${{ inputs.machines || '8' }} 台（自适应错峰 ${STAGGER}s/台）"
             echo "- 共同目标：$TARGET 个地址（全部机器达标即停）"
             echo "- 状态：$STATUS"
             echo "- ${EXPECT}"
