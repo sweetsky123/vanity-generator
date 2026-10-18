@@ -242,10 +242,12 @@ docker compose up -d
 # 命中的加密文件（vanity_*.asc）会出现在 ./config/ 目录
 ```
 
-或直接拉取镜像（CI 自动构建并发布）：
+或直接拉取镜像（CI 随版本发布自动构建：镜像 Tag 与 Release 版本号一致）：
 
 ```bash
 docker pull ghcr.io/sweetsky123/vanity-generator:latest
+# 或锁定具体版本（版本号即 Release 的 tag，如 0.1.0）：
+docker pull ghcr.io/sweetsky123/vanity-generator:0.1.0
 docker run --rm --network none -v ./config:/config \
   ghcr.io/sweetsky123/vanity-generator --config /config/config.yaml
 ```
@@ -268,11 +270,15 @@ docker run --rm --network none -v ./config:/config \
    全并行零延迟；目标数较少时按"单机预计完成时长 ×2.5（上限 45 秒）"
    错峰——该情形总时长本就只有秒级～分钟级，后启机器达标即跳过，
    总命中可精确停在目标数量
-### 版本发布与重新发布规范（2026-10-11 重构）
+### 版本发布与重新发布规范（2026-10-11 重构，2026-10-18 增补）
 
-- **发布方式**：Actions → Release → Run workflow → 填版本号（如 `v0.2.0`，
-  留空自动读 `Cargo.toml`）。流程为 **构建全绿 → publish 阶段才创建 tag
-  与 Release**：构建失败零残留（不产生任何 tag/Release）。
+- **发布方式**：Actions → Release → Run workflow → 填版本号（`0.2.0` 或
+  `v0.2.0` 均可，留空自动读 `Cargo.toml`）。流程为 **构建全绿 → publish
+  阶段才创建 tag 与 Release**：构建失败零残留（不产生任何 tag/Release）。
+- **Docker 镜像联动（2026-10-18）**：Release 发布成功后同一 run 内级联
+  构建镜像，镜像 Tag 与版本号一致（如 `ghcr.io/sweetsky123/vanity-generator:0.1.0`
+  及 `latest`）。也可在 Docker 工作流手动运行填版本号；手动 `git push`
+  `v*` / 数字开头的 tag 同样触发。镜像清理见「手动清理全部 Packages」工作流。
 - **重复发布同一版本**：幂等补传（仅覆盖同名资产），永不删除既有
   Release；资产已完整时默认跳过，勾选 `force` 强制重建。
 - **旧习惯兼容**：手动 `git push tag v*` 仍可触发；但若该 tag 的
